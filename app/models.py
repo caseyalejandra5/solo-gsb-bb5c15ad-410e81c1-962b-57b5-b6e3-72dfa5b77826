@@ -138,7 +138,18 @@ class TransferIn(BaseModel):
     time: TimeValue = Field(..., description="操作时间：数值序号或 ISO 8601 字符串")
     source: str = Field(..., min_length=1, description="源样本管 id")
     target: str = Field(..., min_length=1, description="目标样本管 id")
-    amount: float = Field(..., gt=0, description="转移体积，必须大于源管当前可用体积才合法")
+    amount: float = Field(
+        ..., gt=0, description="从源管吸取（移出源管）的体积，不得大于源管当前可用体积"
+    )
+    delivered_amount: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "实际进入目标管的体积；不传或等于 amount 时视为无损。"
+            "小于 amount 时差额记为该步移液损耗（lost），按源管当时浓度"
+            "与来源构成累计到结果 waste"
+        ),
+    )
 
     @field_validator("source", "target")
     @classmethod
@@ -154,10 +165,18 @@ class TransferIn(BaseModel):
         parse_time(value)  # 提前校验，错误会定位到该字段
         return value
 
-    @field_validator("amount")
+    @field_validator("amount", "delivered_amount")
     @classmethod
-    def _finite_amount(cls, value: float) -> float:
-        return _finite_number(value, "amount")
+    def _finite_amount(cls, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        return _finite_number(value, "amount / delivered_amount")
+
+    @model_validator(mode="after")
+    def _delivered_not_above_amount(self) -> "TransferIn":
+        if self.delivered_amount is not None and self.delivered_amount > self.amount:
+            raise ValueError("delivered_amount 必须大于 0 且不大于 amount")
+        return self
 
 
 class SimulationRequest(BaseModel):
@@ -204,13 +223,32 @@ class TransferredOut(BaseModel):
     origins: list[OriginOut]
 
 
+class LostOut(BaseModel):
+    """单步移液损耗：amount - delivered_amount 的体积及其携带物。"""
+
+    volume: float
+    concentrations: dict[str, float]
+    marker_amount: dict[str, float]
+    origins: list[OriginOut]
+
+
+class WasteOut(BaseModel):
+    """全程累计移液损耗（各步 lost 之和）。"""
+
+    volume: float
+    marker_amount: dict[str, float]
+    origins: list[OriginOut]
+
+
 class ConservationOut(BaseModel):
     volume_before: float
     volume_after: float
     volume_difference: float
+    tube_volume_change: float
     marker_amount_before: dict[str, float]
     marker_amount_after: dict[str, float]
     marker_amount_difference: dict[str, float]
+    tube_marker_amount_change: dict[str, float]
 
 
 class StepOut(BaseModel):
@@ -220,7 +258,9 @@ class StepOut(BaseModel):
     source: str
     target: str
     amount: float
+    delivered_amount: float
     transferred: TransferredOut
+    lost: LostOut
     source_after: TubeStateOut
     target_after: TubeStateOut
     conservation: ConservationOut
@@ -230,9 +270,11 @@ class GlobalConservationOut(BaseModel):
     initial_total_volume: float
     final_total_volume: float
     volume_difference: float
+    tube_volume_change: float
     initial_marker_amount: dict[str, float]
     final_marker_amount: dict[str, float]
     marker_amount_difference: dict[str, float]
+    tube_marker_amount_change: dict[str, float]
 
 
 class ErrorDetail(BaseModel):
@@ -250,6 +292,7 @@ class SimulationResult(BaseModel):
     initial_states: list[TubeStateOut]
     steps: list[StepOut]
     final_states: list[TubeStateOut]
+    waste: WasteOut
     conservation: Optional[GlobalConservationOut] = None
     error: Optional[ErrorDetail] = None
 

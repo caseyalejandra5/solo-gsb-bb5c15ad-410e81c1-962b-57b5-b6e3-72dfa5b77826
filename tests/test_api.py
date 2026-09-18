@@ -168,3 +168,110 @@ def test_pagination(client):
     page = client.get("/api/simulations", params={"limit": 2, "offset": 0}).json()
     assert len(page["items"]) == 2
     assert page["limit"] == 2
+
+
+def test_delivered_amount_loss_persisted(client):
+    payload = {
+        "name": "移液损耗实验",
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 10.0},
+            {"id": "B", "initial_volume": 100.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {
+                "time": 1,
+                "source": "A",
+                "target": "B",
+                "amount": 40.0,
+                "delivered_amount": 36.0,
+            }
+        ],
+    }
+    created = client.post("/api/simulations", json=payload)
+    assert created.status_code == 201
+    body = created.json()
+
+    step = body["steps"][0]
+    assert step["amount"] == 40.0
+    assert step["delivered_amount"] == 36.0
+    assert step["transferred"]["volume"] == 36.0
+    assert step["lost"]["volume"] == 4.0
+    assert step["lost"]["marker_amount"]["default"] == 40.0
+    assert step["source_after"]["volume"] == 60.0
+    assert step["target_after"]["volume"] == 136.0
+    assert body["waste"]["volume"] == 4.0
+    assert body["waste"]["marker_amount"]["default"] == 40.0
+
+    # 系统口径守恒为 0；管内口径下降量等于损耗
+    assert body["conservation"]["volume_difference"] == 0
+    assert body["conservation"]["tube_volume_change"] == -4.0
+    assert body["conservation"]["marker_amount_difference"]["default"] == 0
+    assert body["conservation"]["tube_marker_amount_change"]["default"] == -40.0
+
+    # 完整结果（含 waste / lost）已持久化，可复查
+    fetched = client.get(f"/api/simulations/{body['id']}")
+    assert fetched.status_code == 200
+    saved = fetched.json()
+    assert saved["waste"] == body["waste"]
+    assert saved["steps"][0]["lost"]["volume"] == 4.0
+    assert saved["conservation"]["tube_volume_change"] == -4.0
+
+
+def test_legacy_request_without_delivered_amount_compatible(client):
+    # 旧请求（VALID_PAYLOAD 不含 delivered_amount）响应结构向后兼容：
+    # delivered_amount 回填为 amount，waste / lost 均为 0
+    response = client.post("/api/simulations", json=VALID_PAYLOAD)
+    assert response.status_code == 201
+    body = response.json()
+    step = body["steps"][0]
+    assert step["amount"] == 40.0
+    assert step["delivered_amount"] == 40.0
+    assert step["lost"]["volume"] == 0.0
+    assert body["waste"]["volume"] == 0.0
+    assert body["conservation"]["volume_difference"] == 0
+    assert body["conservation"]["tube_volume_change"] == 0
+    assert body["conservation"]["marker_amount_difference"]["default"] == 0
+
+
+def test_delivered_amount_greater_than_amount_rejected(client):
+    payload = {
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 10.0},
+            {"id": "B", "initial_volume": 100.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {
+                "time": 1,
+                "source": "A",
+                "target": "B",
+                "amount": 40.0,
+                "delivered_amount": 40.0001,
+            }
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 422
+    text = str(response.json()["detail"])
+    assert "delivered_amount" in text
+
+
+def test_non_positive_delivered_amount_rejected(client):
+    payload = {
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 10.0},
+            {"id": "B", "initial_volume": 100.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {
+                "time": 1,
+                "source": "A",
+                "target": "B",
+                "amount": 40.0,
+                "delivered_amount": 0,
+            }
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 422
+    locs = [".".join(str(x) for x in e["loc"]) for e in response.json()["detail"]]
+    assert any(loc.endswith("delivered_amount") for loc in locs)

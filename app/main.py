@@ -25,10 +25,11 @@ app = FastAPI(
     title="实验室样本混样追踪 API",
     description=(
         "提交初始样本（体积 + 标记物浓度）和按时间排序的转移操作，"
-        "服务在体积守恒前提下逐步计算混合浓度与来源占比，"
-        "并将每次模拟记录持久化到 SQLite。"
+        "服务逐步计算混合浓度与来源占比，并对含移液损耗（可选 "
+        "delivered_amount）的系统按“所有管内 + 累计 waste”口径做守恒校验，"
+        "每次模拟记录持久化到 SQLite。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 

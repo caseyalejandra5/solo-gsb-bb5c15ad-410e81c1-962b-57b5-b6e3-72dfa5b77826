@@ -2,11 +2,15 @@
 
 基于 **Python + FastAPI + SQLite** 的实验室样本混样（pooling）追踪服务。
 客户端提交初始样本（体积 + 标记物浓度）与按时间排序的转移操作，服务在
-**体积守恒 / 标记物质量守恒** 的前提下，逐步计算每次转移后：
+**系统总量守恒（所有管内 + 累计移液损耗 waste）** 的前提下，逐步计算每次转移后：
 
 * 每支管的**当前体积**与各标记物的**混合浓度**；
 * 管内液体的**来源构成与占比**（来自哪些初始样本、各占多少体积 / 百分比）；
-* 本次转移的**守恒校验**（转移前后总体积、各标记物总质量之差）。
+* 可选 `delivered_amount` 时的**移液损耗追踪**：吸出量 `amount` 与实际
+  入管量 `delivered_amount` 的差额按源管当时浓度、来源比例计入该步 `lost`，
+  并累计为结果 `waste`；
+* 两个口径的守恒量：含 waste 的**系统总量差**（应恒为 0）与仅看管内的
+  **管内体积 / 质量变化**（恰好等于累计损耗）。
 
 转移量超出当前可用体积、时间逆序、引用未声明的样本时，返回 **HTTP 400** 和
 定位明确的结构化错误（如 `transfers[2].source`），失败记录同样持久化。
@@ -40,6 +44,39 @@ docker compose down          # 保留数据
 docker compose down -v       # 同时清空数据库卷
 ```
 
+### 启动后的示例（含移液损耗追踪）
+
+服务起来后，另开一个终端执行（第一步吸 50 只注入 48，损耗 2）：
+
+```bash
+# 1) 提交模拟
+curl -s -X POST http://localhost:8000/api/simulations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Docker 启动自检-含移液损耗",
+    "samples": [
+      {"id": "S1", "initial_volume": 100, "concentration": 12.5},
+      {"id": "S2", "initial_volume": 50, "markers": {"RFP": 8}}
+    ],
+    "transfers": [
+      {"time": 1, "source": "S1", "target": "S2", "amount": 50, "delivered_amount": 48},
+      {"time": 2, "source": "S2", "target": "S1", "amount": 25}
+    ]
+  }' | python3 -m json.tool
+
+# 2) 用上一步返回的 id 复查（含 waste / lost 的完整结果已落库）
+curl -s http://localhost:8000/api/simulations/<id> | python3 -m json.tool
+
+# 3) 查看历史列表
+curl -s "http://localhost:8000/api/simulations?limit=10" | python3 -m json.tool
+```
+
+预期要点：第一步 `steps[0].lost.volume == 2.0`、
+`waste.marker_amount.default == 25.0`、管内合计 148 但
+`conservation.final_total_volume == 150.0`（含 waste）、
+`volume_difference == 0` 且 `tube_volume_change == -2.0`；
+第二步未传 `delivered_amount`，`lost.volume == 0`，行为与旧版一致。
+
 ---
 
 ## 本地开发（不使用 Docker）
@@ -70,15 +107,30 @@ pytest -q
 
 ## 物理模型与计算规则
 
-1. **充分混匀假设**：每次转移前，源管内液体视为完全混匀，转出液体携带源管
+1. **充分混匀假设**：每次转移前，源管内液体视为完全混匀，吸出液体携带源管
    当前的混合浓度与来源构成。
-2. **体积守恒**：所有管的体积之和在每次转移前后不变。
-3. **标记物质量守恒**：对每种标记物，`Σ 管内体积 × 该管浓度` 不变；
-   混合在“质量域”完成，目标管新浓度 = 混合后总质量 / 混合后总体积。
-4. **来源追踪**：每支管记录“来自各初始样本的净体积”。转出时按源管当前
-   来源占比分摊；目标管累加。占比之和恒为 1（空管除外）。
-5. **浮点处理**：小于 `1e-12` 的残余量按 0 清理，结果保留 12 位小数。
-6. **时间规则**：转移必须按时间**非递减**（允许同一时刻多次操作）。
+2. **吸 / 注分离与移液损耗**：每次转移的 `amount` 是从源管**吸出**（移出
+   源管）的体积；可选 `delivered_amount` 是实际**进入目标管**的体积，要求
+   `0 < delivered_amount ≤ amount`。差额 `amount - delivered_amount` 记为
+   该步移液损耗 `lost`，损耗液的浓度、标记物质量与来源比例与吸出液一致，
+   并累计到全程 `waste`。不传 `delivered_amount` 时按无损处理
+   （`delivered_amount == amount`，旧请求完全兼容）。
+3. **系统总量守恒（含 waste）**：
+   `Σ 各管体积 + waste 体积`、`Σ 管内标记物质量 + waste 标记物质量`
+   在每次转移前后都不变，对应结果中的
+   `conservation.volume_difference` / `marker_amount_difference`（恒为 0）。
+4. **管内口径单独给出**：仅看管内，总体积 / 总质量随损耗下降，下降量恰好
+   等于累计 waste，对应 `tube_volume_change` / `tube_marker_amount_change`
+   （每步）与全程同名字段。混合仍在“质量域”完成：目标管新浓度 =
+   入管质量 / 入管后总体积。
+5. **超量校验口径**：是否超量始终按吸出量 `amount` 与源管当前体积判断，
+   与 `delivered_amount` 无关。
+6. **来源追踪**：每支管记录“来自各初始样本的净体积”。吸出量按源管当前
+   来源占比在“入管 / 损耗”两部分间分摊；目标管累加入管部分，waste 累加
+   损耗部分。管内占比以管内体积为分母、waste 占比以累计损耗体积为分母，
+   各自之和恒为 1（空集合除外）。
+7. **浮点处理**：小于 `1e-12` 的残余量按 0 清理，结果保留 12 位小数。
+8. **时间规则**：转移必须按时间**非递减**（允许同一时刻多次操作）。
 
 标记物支持两种写法，可混用：
 
@@ -102,17 +154,21 @@ pytest -q
 curl -s -X POST http://localhost:8000/api/simulations \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "两管互混实验",
+    "name": "含移液损耗的两管互混",
     "samples": [
       {"id": "S1", "initial_volume": 100, "concentration": 12.5},
       {"id": "S2", "initial_volume": 50,  "markers": {"RFP": 8}}
     ],
     "transfers": [
-      {"time": "2026-09-18T09:00:00Z", "source": "S1", "target": "S2", "amount": 50},
+      {"time": "2026-09-18T09:00:00Z", "source": "S1", "target": "S2", "amount": 50, "delivered_amount": 48},
       {"time": "2026-09-18T10:30:00Z", "source": "S2", "target": "S1", "amount": 25}
     ]
   }'
 ```
+
+第一步从 S1 吸出 `50` 但实际注入 S2 `48`，`2` 的差额按 S1 当时浓度
+（`default=12.5`）计入该步 `lost` 并累计到 `waste`；第二步未传
+`delivered_amount`，视为无损（`delivered_amount == 25`）。
 
 `time` 既可以是 ISO 8601 字符串（`...Z` / 带时区偏移；无时区按 UTC），
 也可以是数值序号（`1`、`2.5`），但同一请求中需保持可比较的递增顺序。
@@ -129,25 +185,58 @@ curl -s -X POST http://localhost:8000/api/simulations \
     {
       "index": 0,
       "time": "2026-09-18T09:00:00Z",
-      "source": "S1", "target": "S2", "amount": 50.0,
-      "transferred": {            // 转出液本身的浓度与来源构成
-        "volume": 50.0,
+      "source": "S1", "target": "S2",
+      "amount": 50.0,              // 从源管吸出的体积
+      "delivered_amount": 48.0,    // 实际进入目标管的体积（缺省 = amount）
+      "transferred": {             // 入管液体（48）的浓度与来源构成
+        "volume": 48.0,
         "concentrations": {"RFP": 0.0, "default": 12.5},
-        "origins": [{"source_id": "S1", "volume": 50.0, "volume_fraction": 1.0}]
+        "origins": [{"source_id": "S1", "volume": 48.0, "volume_fraction": 1.0}]
       },
-      "source_after": { /* 转移后源管状态 */ },
-      "target_after": { /* 转移后目标管状态：浓度、origins 占比 */ },
-      "conservation": {           // 该步守恒校验，差值应为 0
-        "volume_before": 150.0, "volume_after": 150.0, "volume_difference": 0.0,
-        "marker_amount_difference": {"RFP": 0.0, "default": 0.0}
+      "lost": {                    // 本步移液损耗（50 - 48 = 2）
+        "volume": 2.0,
+        "concentrations": {"RFP": 0.0, "default": 12.5},
+        "marker_amount": {"RFP": 0.0, "default": 25.0},
+        "origins": [{"source_id": "S1", "volume": 2.0, "volume_fraction": 1.0}]
+      },
+      "source_after": { /* 按吸出量 50 扣减：S1 剩 50 */ },
+      "target_after": { /* 按入管量 48 增加：S2 变为 98 */ },
+      "conservation": {
+        // before/after 为“所有管内 + 截至本步累计 waste”的系统口径
+        "volume_before": 150.0, "volume_after": 150.0,
+        "volume_difference": 0.0,            // 系统总量差：恒为 0
+        "tube_volume_change": -2.0,          // 仅看管内的体积变化
+        "marker_amount_before": {"RFP": 400.0, "default": 1250.0},
+        "marker_amount_after":  {"RFP": 400.0, "default": 1250.0},
+        "marker_amount_difference": {"RFP": 0.0, "default": 0.0},
+        "tube_marker_amount_change": {"RFP": 0.0, "default": -25.0}
       }
-    }
+    },
+    { /* index 1：无损步，delivered_amount == amount == 25，lost.volume == 0 */ }
   ],
-  "final_states": [ /* 终态 */ ],
-  "conservation": { /* 全程守恒汇总 */ },
+  "final_states": [ /* 终态：S1=75、S2=73（管内合计 148） */ ],
+  "waste": {                         // 全程累计移液损耗（各步 lost 之和）
+    "volume": 2.0,
+    "marker_amount": {"RFP": 0.0, "default": 25.0},
+    "origins": [{"source_id": "S1", "volume": 2.0, "volume_fraction": 1.0}]
+  },
+  "conservation": {
+    "initial_total_volume": 150.0,
+    "final_total_volume": 150.0,     // 系统口径：管内 148 + waste 2
+    "volume_difference": 0.0,        // 系统总量差
+    "tube_volume_change": -2.0,      // 管内口径变化 = -waste 体积
+    "initial_marker_amount": {"RFP": 400.0, "default": 1250.0},
+    "final_marker_amount":  {"RFP": 400.0, "default": 1250.0},
+    "marker_amount_difference": {"RFP": 0.0, "default": 0.0},
+    "tube_marker_amount_change": {"RFP": 0.0, "default": -25.0}
+  },
   "error": null
 }
 ```
+
+旧请求不传 `delivered_amount` 时，每步 `delivered_amount` 回填为 `amount`、
+`lost.volume` 为 `0`、`origins` 为空，顶层 `waste` 同样为零，
+`tube_*_change` 与系统差值均为 `0`，原有字段语义不变。
 
 ### 错误响应（定位明确）
 
@@ -159,7 +248,7 @@ curl -s -X POST http://localhost:8000/api/simulations \
   "status": "failed",
   "error": {
     "code": "INSUFFICIENT_VOLUME",
-    "message": "transfers[0] 试图从 'A' 转出 99.0，但该管当前仅有 5.0",
+    "message": "transfers[0] 试图从 'A' 吸取 99.0，但该管当前仅有 5.0",
     "transfer_index": 0,
     "location": "transfers[0].amount"
   },
@@ -177,8 +266,9 @@ curl -s -X POST http://localhost:8000/api/simulations \
 | `SAME_SOURCE_TARGET` | 源管与目标管相同 | `transfers[i]` |
 | `SIMULATION_NOT_FOUND` | 查询不存在的记录 id | `path.sim_id` |
 
-请求体本身的字段问题（负数体积、缺少浓度、未知字段、样本 id 重复等）返回
-FastAPI 标准 `422` 结构，`detail[].loc` 指明出错字段路径。
+请求体本身的字段问题（负数体积、缺少浓度、未知字段、样本 id 重复、
+`delivered_amount` 非正数或大于 `amount` 等）返回 FastAPI 标准 `422` 结构，
+`detail[].loc` 指明出错字段路径。
 
 ### 查询与列表
 
@@ -201,12 +291,12 @@ curl "http://localhost:8000/api/simulations?status=failed"
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由（创建 / 查询 / 列表 / 健康检查）
 │   ├── models.py      # Pydantic 请求与响应模型、时间解析
-│   ├── engine.py      # 混样模拟核心（浓度 / 来源 / 守恒）
+│   ├── engine.py      # 混样模拟核心（浓度 / 来源 / 移液损耗 / 守恒）
 │   └── database.py    # SQLite 连接与记录持久化
 ├── tests/
 │   ├── conftest.py
-│   ├── test_engine.py # 引擎计算与错误定位
-│   └── test_api.py    # API 端到端（22 个用例）
+│   ├── test_engine.py # 引擎计算、移液损耗 / 来源 / 守恒与错误定位
+│   └── test_api.py    # API 端到端（17 个用例，含损耗追踪与持久化）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -220,7 +310,8 @@ curl "http://localhost:8000/api/simulations?status=failed"
   busy timeout 以兼容多 worker 部署。
 * **失败也持久化**：成功和失败的模拟都落库，失败记录保留已执行步骤与
   现场状态，方便审计与复盘。
-* **浓度统一在质量域计算**：避免反复稀释 / 混合引入的累积误差，所有
-  `conservation.*_difference` 均可直接用于自动校验。
+* **浓度统一在质量域计算**：避免反复稀释 / 混合引入的累积误差；
+  `conservation.*_difference`（含 waste 的系统口径）恒为 0，可直接用于
+  自动校验，`tube_*_change` 则给出仅管内口径的下降量，便于核对损耗账。
 * **安全默认值**：容器以非 root 用户运行，附带 healthcheck；请求模型
   禁止额外字段（`extra=forbid`），防止拼写错误被静默忽略。
