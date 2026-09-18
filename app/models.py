@@ -7,6 +7,10 @@
 
 转移时间既可以是数值型序号（``1``、``2.5``），也可以是 ISO 8601 字符串
 （``2026-09-18T10:00:00Z``）；同一批转移必须按时间非递减排列。
+
+每次转移的 ``amount`` 是从源管吸取的体积；可选 ``delivered_amount``
+（``0 < delivered_amount <= amount``）表示实际注入目标管的体积，差额视为
+移液损耗并累计到结果的 ``waste`` 中。不传 ``delivered_amount`` 时默认无损耗。
 """
 from __future__ import annotations
 
@@ -130,7 +134,13 @@ class SampleIn(BaseModel):
 
 
 class TransferIn(BaseModel):
-    """一次从源管到目标管的定量转移（转移前默认管内已充分混匀）。"""
+    """一次从源管到目标管的定量转移（转移前默认管内已充分混匀）。
+
+    ``amount`` 表示从源管**吸取**的体积；可选的 ``delivered_amount`` 表示
+    实际注入目标管的体积（模拟移液枪挂壁 / 残液等损耗），满足
+    ``0 < delivered_amount <= amount``。差额 ``amount - delivered_amount``
+    计入废液（waste），按源管当时的浓度与来源构成追踪。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -138,7 +148,15 @@ class TransferIn(BaseModel):
     time: TimeValue = Field(..., description="操作时间：数值序号或 ISO 8601 字符串")
     source: str = Field(..., min_length=1, description="源样本管 id")
     target: str = Field(..., min_length=1, description="目标样本管 id")
-    amount: float = Field(..., gt=0, description="转移体积，必须大于源管当前可用体积才合法")
+    amount: float = Field(..., gt=0, description="从源管吸取的体积，不得大于源管当前可用体积")
+    delivered_amount: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "实际注入目标管的体积；必须满足 0 < delivered_amount <= amount。"
+            "不传时默认等于 amount（无移液损耗）。"
+        ),
+    )
 
     @field_validator("source", "target")
     @classmethod
@@ -154,10 +172,24 @@ class TransferIn(BaseModel):
         parse_time(value)  # 提前校验，错误会定位到该字段
         return value
 
-    @field_validator("amount")
+    @field_validator("amount", "delivered_amount")
     @classmethod
-    def _finite_amount(cls, value: float) -> float:
-        return _finite_number(value, "amount")
+    def _finite_amount(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None:
+            _finite_number(value, "数值")
+        return value
+
+    @model_validator(mode="after")
+    def _delivered_not_above_amount(self) -> "TransferIn":
+        if (
+            self.delivered_amount is not None
+            and self.delivered_amount > self.amount
+        ):
+            raise ValueError(
+                f"delivered_amount（实际注入体积 {self.delivered_amount}）不能大于 "
+                f"amount（吸取体积 {self.amount}）：移液损耗只可能让目标管收到更少"
+            )
+        return self
 
 
 class SimulationRequest(BaseModel):
@@ -204,13 +236,46 @@ class TransferredOut(BaseModel):
     origins: list[OriginOut]
 
 
-class ConservationOut(BaseModel):
+class CompositionOut(BaseModel):
+    """一段液体（损耗 / 累计废液）的体积、浓度、质量与来源构成。"""
+
+    volume: float
+    concentrations: dict[str, float]
+    marker_amount: dict[str, float]
+    origins: list[OriginOut]
+
+
+class TubeVolumeChangeOut(BaseModel):
+    """某一步中单支管的体积变化。"""
+
+    tube_id: str
     volume_before: float
     volume_after: float
-    volume_difference: float
-    marker_amount_before: dict[str, float]
-    marker_amount_after: dict[str, float]
-    marker_amount_difference: dict[str, float]
+    volume_change: float
+
+
+class ConservationOut(BaseModel):
+    # 管内口径
+    tube_volume_before: float
+    tube_volume_after: float
+    tube_volume_change: float
+    tube_marker_amount_before: dict[str, float]
+    tube_marker_amount_after: dict[str, float]
+    tube_marker_amount_change: dict[str, float]
+    # 管内体积变化的逐管明细
+    tube_volume_changes: list[TubeVolumeChangeOut]
+    # 系统口径：管内 + 累计废液
+    waste_volume_before: float
+    waste_volume_after: float
+    waste_marker_amount_before: dict[str, float]
+    waste_marker_amount_after: dict[str, float]
+    system_volume_before: float
+    system_volume_after: float
+    # 系统总量差：(管内 + 累计废液) 之后 − 之前，守恒时为 0
+    system_volume_difference: float
+    system_marker_amount_before: dict[str, float]
+    system_marker_amount_after: dict[str, float]
+    system_marker_amount_difference: dict[str, float]
 
 
 class StepOut(BaseModel):
@@ -220,19 +285,35 @@ class StepOut(BaseModel):
     source: str
     target: str
     amount: float
+    delivered_amount: float
     transferred: TransferredOut
+    lost: CompositionOut
+    waste_after: CompositionOut
     source_after: TubeStateOut
     target_after: TubeStateOut
     conservation: ConservationOut
 
 
 class GlobalConservationOut(BaseModel):
+    # 管内口径
     initial_total_volume: float
     final_total_volume: float
     volume_difference: float
     initial_marker_amount: dict[str, float]
     final_marker_amount: dict[str, float]
     marker_amount_difference: dict[str, float]
+    # 管内体积变化的逐管明细
+    tube_volume_changes: list[TubeVolumeChangeOut]
+    # 累计废液
+    waste_total_volume: float
+    waste_marker_amount: dict[str, float]
+    # 系统口径：管内 + 累计废液，差值在守恒时为 0
+    system_initial_volume: float
+    system_final_volume: float
+    system_volume_difference: float
+    system_initial_marker_amount: dict[str, float]
+    system_final_marker_amount: dict[str, float]
+    system_marker_amount_difference: dict[str, float]
 
 
 class ErrorDetail(BaseModel):
@@ -250,6 +331,7 @@ class SimulationResult(BaseModel):
     initial_states: list[TubeStateOut]
     steps: list[StepOut]
     final_states: list[TubeStateOut]
+    waste: Optional[CompositionOut] = None
     conservation: Optional[GlobalConservationOut] = None
     error: Optional[ErrorDetail] = None
 

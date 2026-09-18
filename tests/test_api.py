@@ -168,3 +168,84 @@ def test_pagination(client):
     page = client.get("/api/simulations", params={"limit": 2, "offset": 0}).json()
     assert len(page["items"]) == 2
     assert page["limit"] == 2
+
+
+# ---------- 移液损耗（delivered_amount / waste） ----------
+
+
+def test_pipetting_loss_response_and_persistence(client):
+    payload = {
+        "name": "loss-demo",
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 10.0},
+            {"id": "B", "initial_volume": 100.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {
+                "time": 1,
+                "source": "A",
+                "target": "B",
+                "amount": 40.0,
+                "delivered_amount": 30.0,
+            },
+        ],
+    }
+    created = client.post("/api/simulations", json=payload)
+    assert created.status_code == 201
+    body = created.json()
+
+    step = body["steps"][0]
+    assert step["amount"] == 40.0
+    assert step["delivered_amount"] == 30.0
+    assert step["lost"]["volume"] == 10.0
+    assert step["lost"]["marker_amount"]["default"] == 100.0
+    assert body["waste"]["volume"] == 10.0
+
+    cons = body["conservation"]
+    # 管内口径少了 10，系统口径守恒
+    assert cons["volume_difference"] == -10.0
+    assert cons["system_volume_difference"] == 0.0
+    assert cons["system_marker_amount_difference"]["default"] == 0.0
+
+    # 完整结果（含 waste）随记录持久化
+    fetched = client.get(f"/api/simulations/{body['id']}").json()
+    assert fetched["waste"]["volume"] == 10.0
+    assert fetched["steps"][0]["delivered_amount"] == 30.0
+    assert fetched["conservation"]["system_volume_difference"] == 0.0
+
+
+def test_delivered_amount_greater_than_amount_rejected_422(client):
+    payload = {
+        "samples": [
+            {"id": "A", "initial_volume": 10.0, "concentration": 1.0},
+            {"id": "B", "initial_volume": 10.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {
+                "time": 1,
+                "source": "A",
+                "target": "B",
+                "amount": 5.0,
+                "delivered_amount": 6.0,
+            },
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 422
+    # 跨字段校验定位到该 transfer 对象：body -> transfers -> 0
+    locs = [".".join(str(x) for x in e["loc"]) for e in response.json()["detail"]]
+    assert any(loc.endswith("transfers.0") for loc in locs)
+    msgs = " ".join(e["msg"] for e in response.json()["detail"])
+    assert "delivered_amount" in msgs
+
+
+def test_legacy_request_without_delivered_amount_compatible(client):
+    # 旧请求体不带 delivered_amount：无损，且新字段按兼容口径回填
+    body = client.post("/api/simulations", json=VALID_PAYLOAD).json()
+    step = body["steps"][0]
+    assert step["delivered_amount"] == step["amount"] == 40.0
+    assert step["lost"]["volume"] == 0.0
+    assert body["waste"]["volume"] == 0.0
+    assert body["conservation"]["system_volume_difference"] == 0.0
+    # 旧字段语义保持不变
+    assert body["conservation"]["volume_difference"] == 0.0
